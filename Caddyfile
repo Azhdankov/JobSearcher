@@ -1,0 +1,6 @@
+:8081 {
+	reverse_proxy sqlite-web:8080
+	basicauth /* {
+		{$SQLITE_WEB_AUTH_USER} {$SQLITE_WEB_AUTH_HASH}
+	}
+}
