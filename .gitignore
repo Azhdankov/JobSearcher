@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+*.session*
+*.sqlite
+*.db
+/data/
+/sessions/
+
+# macOS
+.DS_Store
