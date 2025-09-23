@@ -1,0 +1,16 @@
+services:
+  app:
+    build: .
+    container_name: jobsearcher-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - SQLITE_DB_PATH=/data/telegram_messages.db
+      - SESSION_NAME=/sessions/jobsearcher
+    volumes:
+      - ./data:/data
+      - ./sessions:/sessions
+    tty: true
+
+volumes: {}
