@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 RUN mkdir -p /data /sessions
 
 COPY app.py db.py /app/
+COPY auth_cli.py /app/
 
 # Default env; override in compose
 ENV SQLITE_DB_PATH=/data/telegram_messages.db \

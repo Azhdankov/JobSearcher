@@ -7,10 +7,10 @@ services:
       - .env
     environment:
       - SQLITE_DB_PATH=/data/telegram_messages.db
-      - SESSION_NAME=/sessions/jobsearcher
+      # SESSION_NAME больше не нужен при TELEGRAM_STRING_SESSION
     volumes:
       - ./data:/data
-      - ./sessions:/sessions
+    # никаких tty/stdin_open
 
   sqlite-web:
     image: coleifer/sqlite-web:latest
