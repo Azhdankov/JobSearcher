@@ -80,7 +80,14 @@ async def main() -> None:
     db = Database(settings.sqlite_db_path)
     await db.init()
 
-    client = TelegramClient(settings.session_name, settings.api_id, settings.api_hash)
+    # Normalize session path to always end with .session and ensure directory exists
+    session_path = settings.session_name
+    if not session_path.endswith(".session"):
+        session_path = f"{session_path}.session"
+    session_dir = os.path.dirname(session_path) or "."
+    os.makedirs(session_dir, exist_ok=True)
+
+    client = TelegramClient(session_path, settings.api_id, settings.api_hash)
 
     @client.on(events.NewMessage())
     async def handler(event: events.newmessage.NewMessage.Event) -> None:
