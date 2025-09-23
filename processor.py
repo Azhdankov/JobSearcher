@@ -124,7 +124,7 @@ async def process_once(settings: ProcSettings) -> None:
 
     items = await db.select_new_messages_ordered()
     if not items:
-        logger.info("Нет новых сообщений")
+        logger.info("Нет новых сообщений — спим до следующего цикла")
         return
 
     # Save earliest date among fetched rows
