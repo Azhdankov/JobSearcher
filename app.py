@@ -2,8 +2,9 @@ import asyncio
 import json
 import logging
 import os
+import sys
+import signal
 from datetime import datetime
-import asyncio
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -41,9 +42,7 @@ def load_settings() -> Settings:
         "CLEANUP_INTERVAL_MINUTES": int(os.getenv("CLEANUP_INTERVAL_MINUTES", "60")),
         "FILTER_EXCLUDE_WORDS": os.getenv("FILTER_EXCLUDE_WORDS", ""),
     }
-    # Parse FILTER_EXCLUDE_WORDS as JSON array or comma-separated string
     raw_words = env["FILTER_EXCLUDE_WORDS"]
-    parsed_words: list[str]
     if isinstance(raw_words, list):
         parsed_words = [str(w).strip() for w in raw_words if str(w).strip()]
     else:
@@ -72,20 +71,28 @@ def configure_logging(level: str) -> None:
     )
 
 
-async def main() -> None:
-    settings = load_settings()
+def normalize_session_path(name: str) -> str:
+    session_path = name
+    if not session_path.endswith(".session"):
+        session_path = f"{session_path}.session"
+    session_dir = os.path.dirname(session_path) or "."
+    os.makedirs(session_dir, exist_ok=True)
+    return session_path
+
+
+def session_is_usable(path: str) -> bool:
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+async def run_service(session_path: str, settings: Settings) -> None:
     configure_logging(settings.log_level)
     logger = logging.getLogger("app")
 
     db = Database(settings.sqlite_db_path)
     await db.init()
-
-    # Normalize session path to always end with .session and ensure directory exists
-    session_path = settings.session_name
-    if not session_path.endswith(".session"):
-        session_path = f"{session_path}.session"
-    session_dir = os.path.dirname(session_path) or "."
-    os.makedirs(session_dir, exist_ok=True)
 
     client = TelegramClient(session_path, settings.api_id, settings.api_hash)
 
@@ -108,13 +115,10 @@ async def main() -> None:
             except Exception:
                 author = None
 
-            # Exclude messages that contain any of configured words (case-insensitive substring)
             text_lower = raw_text.lower()
             exclude_hit = any(word.lower() in text_lower for word in settings.exclude_words)
             if exclude_hit:
-                logger.info(
-                    "Skipped message %s from %s due to exclude words", message_id, channel_name
-                )
+                logger.info("Skipped message %s from %s due to exclude words", message_id, channel_name)
                 return
 
             await db.insert_message(
@@ -135,34 +139,99 @@ async def main() -> None:
                 deleted = await db.delete_old_messages(settings.retention_days)
                 if deleted:
                     logger.info("Cleanup: deleted %s old rows", deleted)
-                # Shrink WAL to reclaim disk space immediately
                 await db.wal_checkpoint_truncate()
             except Exception:
                 logger.exception("Cleanup job failed")
-            # Sleep until next run
             await asyncio.sleep(settings.cleanup_interval_minutes * 60)
 
+    # В сервисном режиме — без интерактива.
     async with client:
-        logger.info("Connecting as %s", settings.phone_number)
+        await client.connect()
         if not await client.is_user_authorized():
-            await client.send_code_request(settings.phone_number)
-            print("Введите код из Telegram (смс/приложение): ", end="", flush=True)
-            code = input().strip()
-            try:
-                await client.sign_in(settings.phone_number, code)
-            except SessionPasswordNeededError:
-                if not settings.password:
-                    print("Включена 2FA, нужен пароль TELEGRAM_PASSWORD в .env")
-                    raise
-                await client.sign_in(password=settings.password)
+            logger.error(
+                "Нет валидной сессии по пути %s. Сначала выполните интерактивный вход: "
+                "`docker compose run --rm app python /app/app.py --login`", session_path
+            )
+            return
+
+        me = await client.get_me()
+        size = os.path.getsize(session_path) if os.path.exists(session_path) else -1
+        logger.info("Authorized as %s. Session file: %s (%s bytes)",
+                    getattr(me, "username", None) or getattr(me, "id", "unknown"),
+                    session_path, size)
+
         logger.info("Client started. Listening for new messages...")
-        # Run cleanup in background
         asyncio.create_task(cleanup_job())
-        await client.run_until_disconnected()
+
+        # Аккуратное завершение по сигналам Docker
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, stop_event.set)
+            except NotImplementedError:
+                pass
+
+        await stop_event.wait()
+        # Сохранить сессию явно
+        try:
+            client.session.save()
+        except Exception:
+            logger.exception("Failed to save session on shutdown")
+
+
+async def login_once(session_path: str, settings: Settings) -> None:
+    configure_logging(settings.log_level)
+    logger = logging.getLogger("login")
+
+    if not sys.stdin.isatty():
+        print("Нужен интерактивный TTY для ввода кода/пароля (запустите с -it).")
+        sys.exit(2)
+
+    client = TelegramClient(session_path, settings.api_id, settings.api_hash)
+
+    async with client:
+        async def prompt_code() -> str:
+            print("Введите код из Telegram (смс/приложение): ", end="", flush=True)
+            return input().strip()
+
+        try:
+            await client.start(
+                phone=lambda: settings.phone_number,
+                password=lambda: settings.password or "",
+                code_callback=prompt_code,
+            )
+        except SessionPasswordNeededError:
+            if not settings.password:
+                print("Включена 2FA, нужен пароль TELEGRAM_PASSWORD в .env")
+                raise
+            await client.start(
+                phone=lambda: settings.phone_number,
+                password=lambda: settings.password,
+                code_callback=prompt_code,
+            )
+
+        me = await client.get_me()
+        try:
+            client.session.save()
+        except Exception:
+            logger.exception("Failed to save session after login")
+        size = os.path.getsize(session_path) if os.path.exists(session_path) else -1
+        logger.info("Login OK as %s. Session saved to %s (%s bytes)",
+                    getattr(me, "username", None) or getattr(me, "id", "unknown"),
+                    session_path, size)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    import argparse
+    settings = load_settings()
+    session_path = normalize_session_path(settings.session_name)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--login", action="store_true", help="Интерактивный вход: создать/обновить сессию и выйти.")
+    args = parser.parse_args()
+
+    if args.login:
+        asyncio.run(login_once(session_path, settings))
+    else:
+        asyncio.run(run_service(session_path, settings))

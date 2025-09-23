@@ -11,8 +11,6 @@ services:
     volumes:
       - ./data:/data
       - ./sessions:/sessions
-    tty: true
-    stdin_open: true
 
   sqlite-web:
     image: coleifer/sqlite-web:latest
