@@ -9,6 +9,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 
 from db import Database
@@ -21,6 +22,7 @@ class Settings(BaseModel):
     password: Optional[str] = Field(None, alias="TELEGRAM_PASSWORD")
     sqlite_db_path: str = Field("./telegram_messages.db", alias="SQLITE_DB_PATH")
     session_name: str = Field("jobsearcher", alias="SESSION_NAME")
+    string_session: Optional[str] = Field(None, alias="TELEGRAM_STRING_SESSION")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     retention_days: int = Field(2, alias="RETENTION_DAYS")
     cleanup_interval_minutes: int = Field(60, alias="CLEANUP_INTERVAL_MINUTES")
@@ -36,6 +38,7 @@ def load_settings() -> Settings:
         "TELEGRAM_PASSWORD": os.getenv("TELEGRAM_PASSWORD"),
         "SQLITE_DB_PATH": os.getenv("SQLITE_DB_PATH", "./telegram_messages.db"),
         "SESSION_NAME": os.getenv("SESSION_NAME", "jobsearcher"),
+        "TELEGRAM_STRING_SESSION": os.getenv("TELEGRAM_STRING_SESSION"),
         "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO"),
         "RETENTION_DAYS": int(os.getenv("RETENTION_DAYS", "2")),
         "CLEANUP_INTERVAL_MINUTES": int(os.getenv("CLEANUP_INTERVAL_MINUTES", "60")),
@@ -80,7 +83,11 @@ async def main() -> None:
     db = Database(settings.sqlite_db_path)
     await db.init()
 
-    client = TelegramClient(settings.session_name, settings.api_id, settings.api_hash)
+    # Prefer StringSession if provided (avoids interactive login on restarts)
+    if settings.string_session:
+        client = TelegramClient(StringSession(settings.string_session), settings.api_id, settings.api_hash)
+    else:
+        client = TelegramClient(settings.session_name, settings.api_id, settings.api_hash)
 
     @client.on(events.NewMessage())
     async def handler(event: events.newmessage.NewMessage.Event) -> None:
