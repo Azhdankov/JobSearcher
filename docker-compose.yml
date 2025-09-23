@@ -46,7 +46,7 @@ services:
       - "5678:5678"
     volumes:
       - n8n_data:/home/node/.n8n
-      - ./data:/data:ro
+      - ./data:/data
 
 volumes:
   n8n_data: {}
