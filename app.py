@@ -1,7 +1,9 @@
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime
+import asyncio
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -20,6 +22,9 @@ class Settings(BaseModel):
     sqlite_db_path: str = Field("./telegram_messages.db", alias="SQLITE_DB_PATH")
     session_name: str = Field("jobsearcher", alias="SESSION_NAME")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
+    retention_days: int = Field(2, alias="RETENTION_DAYS")
+    cleanup_interval_minutes: int = Field(60, alias="CLEANUP_INTERVAL_MINUTES")
+    exclude_words: list[str] = Field(default_factory=list, alias="FILTER_EXCLUDE_WORDS")
 
 
 def load_settings() -> Settings:
@@ -32,7 +37,29 @@ def load_settings() -> Settings:
         "SQLITE_DB_PATH": os.getenv("SQLITE_DB_PATH", "./telegram_messages.db"),
         "SESSION_NAME": os.getenv("SESSION_NAME", "jobsearcher"),
         "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO"),
+        "RETENTION_DAYS": int(os.getenv("RETENTION_DAYS", "2")),
+        "CLEANUP_INTERVAL_MINUTES": int(os.getenv("CLEANUP_INTERVAL_MINUTES", "60")),
+        "FILTER_EXCLUDE_WORDS": os.getenv("FILTER_EXCLUDE_WORDS", ""),
     }
+    # Parse FILTER_EXCLUDE_WORDS as JSON array or comma-separated string
+    raw_words = env["FILTER_EXCLUDE_WORDS"]
+    parsed_words: list[str]
+    if isinstance(raw_words, list):
+        parsed_words = [str(w).strip() for w in raw_words if str(w).strip()]
+    else:
+        text = str(raw_words).strip()
+        if not text:
+            parsed_words = []
+        else:
+            try:
+                maybe_list = json.loads(text)
+                if isinstance(maybe_list, list):
+                    parsed_words = [str(w).strip() for w in maybe_list if str(w).strip()]
+                else:
+                    parsed_words = [s.strip() for s in text.split(",") if s.strip()]
+            except json.JSONDecodeError:
+                parsed_words = [s.strip() for s in text.split(",") if s.strip()]
+    env["FILTER_EXCLUDE_WORDS"] = parsed_words
     if env["TELEGRAM_API_ID"] is None:
         raise RuntimeError("TELEGRAM_API_ID is not set")
     return Settings(**env)
@@ -74,6 +101,15 @@ async def main() -> None:
             except Exception:
                 author = None
 
+            # Exclude messages that contain any of configured words (case-insensitive substring)
+            text_lower = raw_text.lower()
+            exclude_hit = any(word.lower() in text_lower for word in settings.exclude_words)
+            if exclude_hit:
+                logger.info(
+                    "Skipped message %s from %s due to exclude words", message_id, channel_name
+                )
+                return
+
             await db.insert_message(
                 message_id=message_id,
                 channel_name=channel_name,
@@ -85,6 +121,19 @@ async def main() -> None:
             logger.info("Saved message %s from %s", message_id, channel_name)
         except Exception as e:
             logger.exception("Failed to process message: %s", e)
+
+    async def cleanup_job() -> None:
+        while True:
+            try:
+                deleted = await db.delete_old_messages(settings.retention_days)
+                if deleted:
+                    logger.info("Cleanup: deleted %s old rows", deleted)
+                # Shrink WAL to reclaim disk space immediately
+                await db.wal_checkpoint_truncate()
+            except Exception:
+                logger.exception("Cleanup job failed")
+            # Sleep until next run
+            await asyncio.sleep(settings.cleanup_interval_minutes * 60)
 
     async with client:
         logger.info("Connecting as %s", settings.phone_number)
@@ -100,6 +149,8 @@ async def main() -> None:
                     raise
                 await client.sign_in(password=settings.password)
         logger.info("Client started. Listening for new messages...")
+        # Run cleanup in background
+        asyncio.create_task(cleanup_job())
         await client.run_until_disconnected()
 
 
