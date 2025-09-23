@@ -80,3 +80,37 @@ class Database:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("VACUUM;")
             await db.commit()
+
+    async def select_new_messages_ordered(self, limit: int | None = None) -> list[dict]:
+        """Return list of messages with status 'new' ordered by date ASC.
+
+        Each item is a dict with keys: id, channel_name, date (ISO str), raw_text, author, status.
+        """
+        query = (
+            "SELECT id, channel_name, date, raw_text, author, status "
+            "FROM messages WHERE status = 'new' ORDER BY datetime(date) ASC"
+        )
+        if limit is not None:
+            query += " LIMIT ?"
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            if limit is not None:
+                async with db.execute(query, (limit,)) as cur:
+                    rows = await cur.fetchall()
+            else:
+                async with db.execute(query) as cur:
+                    rows = await cur.fetchall()
+        return [dict(row) for row in rows]
+
+    async def update_status_completed_since(self, since_iso: str) -> int:
+        """Set status='completed' for all 'new' messages with date >= since_iso.
+
+        Returns number of updated rows.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "UPDATE messages SET status = 'completed' WHERE status = 'new' AND datetime(date) >= datetime(?)",
+                (since_iso,),
+            )
+            await db.commit()
+            return cursor.rowcount or 0

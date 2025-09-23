@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # Create mount points
 RUN mkdir -p /data /sessions
 
-COPY app.py db.py /app/
+COPY app.py db.py processor.py /app/
 COPY auth_cli.py /app/
 
 # Default env; override in compose

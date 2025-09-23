@@ -12,6 +12,20 @@ services:
       - ./data:/data
     # никаких tty/stdin_open
 
+  processor:
+    build: .
+    container_name: jobsearcher-processor
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - SQLITE_DB_PATH=/data/telegram_messages.db
+    depends_on:
+      - app
+    volumes:
+      - ./data:/data
+    command: ["python", "processor.py"]
+
   sqlite-web:
     image: coleifer/sqlite-web:latest
     container_name: jobsearcher-sqlite-web

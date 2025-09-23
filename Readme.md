@@ -9,6 +9,7 @@
 - Статус сообщений по умолчанию — `new`
  - Автоочистка: удаление сообщений старше N дней, освобождение места на диске (WAL checkpoint, auto_vacuum)
  - Фильтрация: сообщения не сохраняются, если содержат слова из `FILTER_EXCLUDE_WORDS`
+ - Периодический процессор: каждые 2 часа отбирает новые записи, анализирует через OpenAI и отправляет результаты в Telegram-бота
 
 ### Структура БД (SQLite)
 Таблица `messages`:
@@ -39,6 +40,14 @@ LOG_LEVEL=INFO
 RETENTION_DAYS=2
 CLEANUP_INTERVAL_MINUTES=60
 FILTER_EXCLUDE_WORDS=["middle", "senior", "6 лет", "большой опыт"]
+
+# Настройки процессора
+OPENAI_API_KEY=sk-... (ключ OpenAI)
+OPENAI_MODEL=gpt-4o-mini
+SELECTION_PROMPT=Опиши здесь критерии отбора сообщений (вакансий)
+TELEGRAM_BOT_TOKEN=... (токен вашего бота)
+TELEGRAM_CHAT_ID=... (ID чата/канала для отправки)
+PROCESSOR_INTERVAL_SECONDS=7200
 ```
 2. Установите зависимости:
 ```
@@ -64,6 +73,22 @@ docker attach jobsearcher-app
 Контейнер будет слушать новые сообщения. База и сессия хранятся в volume-мах:
 - База: `./data/telegram_messages.db`
 - Сессия: файлы в `./sessions`
+
+### Периодический процессор (OpenAI + Bot)
+Скрипт `processor.py` раз в N секунд (по умолчанию 7200) делает:
+1) SELECT всех записей со статусом `new` (ORDER BY `date` ASC)
+2) Сохраняет локально дату самой ранней записи
+3) Отправляет массив записей в OpenAI с промптом `SELECTION_PROMPT`
+4) Получает от OpenAI список `id/channel_name/date`, подходящих под критерий
+5) Делает массовый UPDATE: все `new` с `date >= earliest` → `completed`
+6) Отправляет отобранные записи в Telegram-бота `TELEGRAM_BOT_TOKEN` → `TELEGRAM_CHAT_ID`
+
+Локальный запуск процессора:
+```
+python processor.py
+```
+
+Docker Compose: можно добавить второй сервис с тем же образом, выполняющий `python processor.py`. Убедитесь, что в `.env` заданы ключи OpenAI и параметры бота.
 
 UI для просмотра SQLite (sqlite-web):
 - После `docker compose up -d` откройте `http://<host>:8081` (по умолчанию: `http://localhost:8081`).

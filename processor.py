@@ -1,0 +1,184 @@
+import asyncio
+import json
+import logging
+import os
+from datetime import datetime
+from typing import Any
+
+import httpx
+from dotenv import load_dotenv
+
+from db import Database
+
+
+class ProcSettings:
+    def __init__(self) -> None:
+        load_dotenv()
+        self.sqlite_db_path = os.getenv("SQLITE_DB_PATH", "./telegram_messages.db")
+        self.log_level = os.getenv("LOG_LEVEL", "INFO")
+        self.poll_interval_seconds = int(os.getenv("PROCESSOR_INTERVAL_SECONDS", str(2 * 60 * 60)))
+        self.openai_api_key = os.getenv("OPENAI_API_KEY")
+        self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self.selection_prompt = os.getenv("SELECTION_PROMPT", "Отберите вакансии по моим критериям.")
+        self.telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+
+def configure_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
+async def call_openai_select(api_key: str, model: str, prompt: str, items: list[dict]) -> list[dict]:
+    """Call OpenAI with list of items and return list of {id, channel_name, date} that match criteria.
+
+    The model should return JSON with structure: { "selected": [ {"id": int, "channel_name": str, "date": str} ] }
+    """
+    # Prepare compact payload: send only required fields
+    payload_items = [
+        {
+            "id": it["id"],
+            "channel_name": it["channel_name"],
+            "date": it["date"],
+            "author": it.get("author"),
+            "raw_text": it.get("raw_text", ""),
+        }
+        for it in items
+    ]
+    system_message = (
+        "Ты помощник по отбору вакансий. Тебе дается массив сообщений из Telegram с полями id, channel_name, date, author, raw_text.\n"
+        "Проанализируй сообщения по следующему критерию и верни JSON строго в формате: {\"selected\":[{\"id\":number,\"channel_name\":string,\"date\":string}]}.\n"
+        "Не включай ничего, кроме валидного JSON."
+    )
+    user_message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "text", "text": "Сообщения:"},
+            {"type": "text", "text": json.dumps(payload_items, ensure_ascii=False)},
+        ],
+    }
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_message},
+            user_message,
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2,
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body)
+        resp.raise_for_status()
+        data = resp.json()
+
+    content = data["choices"][0]["message"]["content"]
+    try:
+        parsed = json.loads(content)
+        selected = parsed.get("selected", [])
+        # Basic validation
+        result: list[dict] = []
+        for item in selected:
+            if all(k in item for k in ("id", "channel_name", "date")):
+                result.append({
+                    "id": int(item["id"]),
+                    "channel_name": str(item["channel_name"]),
+                    "date": str(item["date"]),
+                })
+        return result
+    except Exception:
+        logging.getLogger("processor").exception("Failed to parse OpenAI response")
+        return []
+
+
+async def send_to_telegram_bot(token: str, chat_id: str, text: str) -> None:
+    api_url = f"https://api.telegram.org/bot{token}/sendMessage"
+    async with httpx.AsyncClient(timeout=30) as client:
+        await client.post(api_url, json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
+
+
+def format_selected_for_message(all_items: list[dict], selected_keys: set[tuple[int, str, str]]) -> str:
+    parts: list[str] = []
+    for it in all_items:
+        key = (it["id"], it["channel_name"], it["date"])
+        if key in selected_keys:
+            title = f"[{it['channel_name']}] #{it['id']} {it['date']}"
+            snippet = (it.get("raw_text") or "").strip()
+            if len(snippet) > 800:
+                snippet = snippet[:800] + "…"
+            parts.append(f"{title}\n{snippet}")
+    if not parts:
+        return "Подходящих сообщений не найдено за период."
+    return "\n\n".join(parts)
+
+
+async def process_once(settings: ProcSettings) -> None:
+    logger = logging.getLogger("processor")
+    db = Database(settings.sqlite_db_path)
+    await db.init()
+
+    items = await db.select_new_messages_ordered()
+    if not items:
+        logger.info("Нет новых сообщений")
+        return
+
+    # Save earliest date among fetched rows
+    try:
+        earliest_iso = min(items, key=lambda x: x["date"]) ["date"]
+    except Exception:
+        earliest_iso = items[0]["date"]
+
+    selected_keys: list[dict] = []
+    if settings.openai_api_key:
+        selected_keys = await call_openai_select(
+            api_key=settings.openai_api_key,
+            model=settings.openai_model,
+            prompt=settings.selection_prompt,
+            items=items,
+        )
+    else:
+        logger.warning("OPENAI_API_KEY не задан — пропускаю анализ, выберу пустой набор")
+
+    # Update statuses: all 'new' with date >= earliest become 'completed'
+    updated = await db.update_status_completed_since(earliest_iso)
+    logger.info("Помечено completed: %s", updated)
+
+    # Notify Telegram bot if configured
+    if settings.telegram_bot_token and settings.telegram_chat_id:
+        selected_set = {(i["id"], i["channel_name"], i["date"]) for i in selected_keys}
+        text = format_selected_for_message(items, selected_set)
+        try:
+            await send_to_telegram_bot(settings.telegram_bot_token, settings.telegram_chat_id, text)
+            logger.info("Отправлено в бота: %s символов", len(text))
+        except Exception:
+            logger.exception("Не удалось отправить сообщение в Telegram бота")
+    else:
+        logger.info("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — пропускаю отправку")
+
+
+async def main() -> None:
+    settings = ProcSettings()
+    configure_logging(settings.log_level)
+    logger = logging.getLogger("processor")
+    logger.info("Запуск процессора. Интервал: %s сек", settings.poll_interval_seconds)
+    # Immediate run, then sleep-loop
+    while True:
+        try:
+            await process_once(settings)
+        except Exception:
+            logger.exception("Сбой в обработке цикла")
+        await asyncio.sleep(settings.poll_interval_seconds)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+
+
