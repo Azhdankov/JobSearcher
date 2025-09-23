@@ -22,10 +22,13 @@ services:
       - app
     environment:
       - SQLITE_DATABASE=/data/telegram_messages.db
+      - SQLITE_WEB_USERNAME=${SQLITE_WEB_USERNAME}
+      - SQLITE_WEB_PASSWORD=${SQLITE_WEB_PASSWORD}
     ports:
       - "8081:8080"
     volumes:
       - ./data:/data
+    command: ["sh", "-lc", "sqlite_web -H 0.0.0.0 -x /data/telegram_messages.db --username \"$SQLITE_WEB_USERNAME\" --password \"$SQLITE_WEB_PASSWORD\""]
 
   n8n:
     image: n8nio/n8n:latest
@@ -38,6 +41,10 @@ services:
       - N8N_PORT=5678
       - GENERIC_TIMEZONE=Europe/Moscow
       - TZ=Europe/Moscow
+      - N8N_SECURE_COOKIE=false
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
     ports:
       - "5678:5678"
     volumes:
