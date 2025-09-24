@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl import types, functions
 
 from db import Database
 
@@ -72,6 +73,10 @@ def configure_logging(level: str) -> None:
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+    # Видеть логи Telethon (на время диагностики можно DEBUG)
+    logging.getLogger("telethon").setLevel(getattr(logging, level.upper(), logging.INFO))
+    # Немного полезных предупреждений от asyncio (например, про сокеты)
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 
 def normalize_session_path(name: str) -> str:
@@ -90,23 +95,50 @@ async def run_service(settings: Settings) -> None:
     db = Database(settings.sqlite_db_path)
     await db.init()
 
-    # Prefer StringSession (без интерактива). Файловая сессия — только как бэкап-вариант.
+    # Клиент с явными параметрами устойчивости
+    common_kwargs = dict(
+        connection_retries=None,     # бесконечные попытки переподключения
+        request_retries=100,         # ретраи запросов к API
+        retry_delay=1,               # задержка между ретраями
+        timeout=10,                  # сокет-таймаут
+        sequential_updates=False,    # не блокируемся на строгой последовательности
+        flood_sleep_threshold=60,    # спать автоматически при FLOOD_WAIT до 60 сек
+    )
+
     using_string = bool(settings.string_session)
     if using_string:
-        client = TelegramClient(StringSession(settings.string_session), settings.api_id, settings.api_hash)
+        client = TelegramClient(
+            StringSession(settings.string_session),
+            settings.api_id,
+            settings.api_hash,
+            **common_kwargs,
+        )
         session_path_display = "<StringSession>"
     else:
         session_path = normalize_session_path(settings.session_name)
-        client = TelegramClient(session_path, settings.api_id, settings.api_hash)
+        client = TelegramClient(
+            session_path,
+            settings.api_id,
+            settings.api_hash,
+            **common_kwargs,
+        )
         session_path_display = session_path
 
-    @client.on(events.NewMessage())
+    # Диагностируем «слишком длинные» апдейты, после которых Telethon тянет difference
+    @client.on(events.Raw)
+    async def _raw_diag(ev: events.Raw):
+        upd = ev.update
+        if isinstance(upd, (types.UpdatesTooLong, types.UpdateChannelTooLong)):
+            logger.warning("Raw: got *TooLong* update -> Telethon will fetch difference soon")
+
+    # Основной обработчик входящих сообщений
+    @client.on(events.NewMessage(incoming=True))
     async def handler(event: events.newmessage.NewMessage.Event) -> None:
         try:
-            logger.info("New message %s", event.message.id)
             message = event.message
             peer = await event.get_chat()
             channel_name: Optional[str] = getattr(peer, "title", None) or getattr(peer, "username", None) or "unknown"
+            channel_id = getattr(peer, "id", None)
 
             message_id = message.id
             date: datetime = message.date
@@ -120,10 +152,13 @@ async def run_service(settings: Settings) -> None:
             except Exception:
                 author = None
 
-            # Exclude by words (case-insensitive)
+            # Фильтр по стоп-словам (без регистра)
             text_lower = raw_text.lower()
             if any(word.lower() in text_lower for word in settings.exclude_words):
-                logger.info("Skipped message %s from %s due to exclude words", message_id, channel_name)
+                logger.info(
+                    "Skipped message %s (chan=%s id=%s) due to exclude words",
+                    message_id, channel_name, channel_id
+                )
                 return
 
             await db.insert_message(
@@ -134,7 +169,10 @@ async def run_service(settings: Settings) -> None:
                 author=author,
                 status="new",
             )
-            logger.info("Saved message %s from %s", message_id, channel_name)
+            logger.info(
+                "Saved message %s (chan=%s id=%s) at %s",
+                message_id, channel_name, channel_id, date.isoformat()
+            )
         except Exception as e:
             logger.exception("Failed to process message: %s", e)
 
@@ -149,7 +187,24 @@ async def run_service(settings: Settings) -> None:
                 logger.exception("Cleanup job failed")
             await asyncio.sleep(settings.cleanup_interval_minutes * 60)
 
-    # Подключение БЕЗ start() и БЕЗ интерактива.
+    # Health-check апдейтов и сети — логируем pts/qts/seq или ошибку
+    async def health_job() -> None:
+        while True:
+            try:
+                state = await client(functions.updates.GetStateRequest())
+                logger.debug(
+                    "Health: updates state pts=%s qts=%s seq=%s date=%s",
+                    getattr(state, "pts", None),
+                    getattr(state, "qts", None),
+                    getattr(state, "seq", None),
+                    getattr(state, "date", None),
+                )
+            except Exception as e:
+                logger.warning("Health: failed to get updates state: %r", e)
+            finally:
+                await asyncio.sleep(60)
+
+    # Подключение без интерактива
     await client.connect()
     try:
         if not await client.is_user_authorized():
@@ -162,6 +217,12 @@ async def run_service(settings: Settings) -> None:
                 )
             return
 
+        # Тёплый старт — инициализируем стейт обновлений
+        try:
+            await client.get_dialogs(limit=1)
+        except Exception:
+            logger.exception("Warm-up get_dialogs failed")
+
         me = await client.get_me()
         logger.info(
             "Authorized as %s. Session: %s",
@@ -171,34 +232,11 @@ async def run_service(settings: Settings) -> None:
 
         logger.info("Client started. Listening for new messages...")
         asyncio.create_task(cleanup_job())
+        asyncio.create_task(health_job())
 
+        # Ждём либо сигнал ОС, либо окончательный disconnect клиента
         stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
-                loop.add_signal_handler(sig, stop_event.set)
-            except NotImplementedError:
-                pass
-
-        await stop_event.wait()
-
-    finally:
-        # Для файловой сессии — сохранить на выходе; для StringSession — не требуется.
-        if not using_string:
-            try:
-                client.session.save()
-            except Exception:
-                logging.getLogger("app").exception("Failed to save session on shutdown")
-        await client.disconnect()
-
-
-async def main() -> None:
-    settings = load_settings()
-    await run_service(settings)
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+                loop.add
