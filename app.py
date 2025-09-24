@@ -243,13 +243,23 @@ async def run_service(settings: Settings) -> None:
                 pass
 
         # Важно: client.disconnected — Future, не оборачиваем в create_task
-        done, pending = await asyncio.wait(
-            {stop_event.wait(), client.disconnected},
-            return_when=asyncio.FIRST_COMPLETED
-        )
-        # Если отключился клиент — сообщим
-        if client.disconnected in done and not stop_event.is_set():
-            logger.warning("Client disconnected unexpectedly — shutting down gracefully")
+        # А вот stop_event.wait() — корутина, её нужно превратить в Task
+        stop_wait_task = asyncio.create_task(stop_event.wait())
+        try:
+            done, pending = await asyncio.wait(
+                {stop_wait_task, client.disconnected},
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            # Если отключился клиент — сообщим
+            if client.disconnected in done and not stop_event.is_set():
+                logger.warning("Client disconnected unexpectedly — shutting down gracefully")
+        finally:
+            if not stop_wait_task.done():
+                stop_wait_task.cancel()
+                try:
+                    await stop_wait_task
+                except asyncio.CancelledError:
+                    pass
 
     finally:
         # Аккуратно гасим фоновые задачи, чтобы aiosqlite не писала в закрытый loop
