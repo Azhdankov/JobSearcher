@@ -103,6 +103,7 @@ async def run_service(settings: Settings) -> None:
     @client.on(events.NewMessage())
     async def handler(event: events.newmessage.NewMessage.Event) -> None:
         try:
+            logger.info("New message %s", event.message.id)
             message = event.message
             peer = await event.get_chat()
             channel_name: Optional[str] = getattr(peer, "title", None) or getattr(peer, "username", None) or "unknown"
