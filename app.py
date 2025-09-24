@@ -75,7 +75,7 @@ def configure_logging(level: str) -> None:
     )
     # Видеть логи Telethon (на время диагностики можно DEBUG)
     logging.getLogger("telethon").setLevel(getattr(logging, level.upper(), logging.INFO))
-    # Немного полезных предупреждений от asyncio (например, про сокеты)
+    # Немного полезных предупреждений от asyncio
     logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 
@@ -102,7 +102,7 @@ async def run_service(settings: Settings) -> None:
         retry_delay=1,               # задержка между ретраями
         timeout=10,                  # сокет-таймаут
         sequential_updates=False,    # не блокируемся на строгой последовательности
-        flood_sleep_threshold=60,    # спать автоматически при FLOOD_WAIT до 60 сек
+        flood_sleep_threshold=60,    # авто-сон на FLOOD_WAIT до 60 сек
     )
 
     using_string = bool(settings.string_session)
@@ -239,4 +239,41 @@ async def run_service(settings: Settings) -> None:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
-                loop.add
+                loop.add_signal_handler(sig, stop_event.set)
+            except NotImplementedError:
+                # например, на Windows в некоторых средах
+                pass
+
+        wait_stop = asyncio.create_task(stop_event.wait())
+        wait_disconnect = asyncio.create_task(client.disconnected)
+
+        done, pending = await asyncio.wait(
+            {wait_stop, wait_disconnect},
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+
+        if wait_disconnect in done and not wait_stop.done():
+            logger.warning("Client disconnected unexpectedly — shutting down gracefully")
+
+    finally:
+        # Для файловой сессии — сохранить на выходе; для StringSession — не требуется.
+        if not using_string:
+            try:
+                client.session.save()
+            except Exception:
+                logging.getLogger("app").exception("Failed to save session on shutdown")
+        await client.disconnect()
+
+
+async def main() -> None:
+    settings = load_settings()
+    await run_service(settings)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
