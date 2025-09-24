@@ -49,13 +49,13 @@ async def call_openai_select(api_key: str, model: str, prompt: str, items: list[
     ]
     system_message = (
         "Ты помощник по отбору вакансий. Тебе дается массив сообщений из Telegram с полями id, channel_name, date, author, raw_text.\n"
-        "Проанализируй сообщения по следующему критерию и верни JSON строго в формате: {\"selected\":[{\"id\":number,\"channel_name\":string,\"date\":string}]}.\n"
+        f"Критерии отбора: {prompt}\n"
+        "Проанализируй сообщения и верни JSON строго в формате: {\"selected\":[{\"id\":number,\"channel_name\":string,\"date\":string}]}.\n"
         "Не включай ничего, кроме валидного JSON."
     )
     user_message = {
         "role": "user",
         "content": [
-            {"type": "text", "text": prompt},
             {"type": "text", "text": "Сообщения:"},
             {"type": "text", "text": json.dumps(payload_items, ensure_ascii=False)},
         ],

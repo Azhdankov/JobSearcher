@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl import types, functions
 
 from db import Database
 
@@ -72,6 +73,8 @@ def configure_logging(level: str) -> None:
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+    logging.getLogger("telethon").setLevel(getattr(logging, level.upper(), logging.INFO))
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 
 def normalize_session_path(name: str) -> str:
@@ -90,23 +93,49 @@ async def run_service(settings: Settings) -> None:
     db = Database(settings.sqlite_db_path)
     await db.init()
 
-    # Prefer StringSession (без интерактива). Файловая сессия — только как бэкап-вариант.
+    # Устойчивые параметры клиента
+    common_kwargs = dict(
+        connection_retries=None,
+        request_retries=100,
+        retry_delay=1,
+        timeout=10,
+        sequential_updates=False,
+        flood_sleep_threshold=60,
+    )
+
     using_string = bool(settings.string_session)
     if using_string:
-        client = TelegramClient(StringSession(settings.string_session), settings.api_id, settings.api_hash)
+        client = TelegramClient(
+            StringSession(settings.string_session),
+            settings.api_id,
+            settings.api_hash,
+            **common_kwargs,
+        )
         session_path_display = "<StringSession>"
     else:
         session_path = normalize_session_path(settings.session_name)
-        client = TelegramClient(session_path, settings.api_id, settings.api_hash)
+        client = TelegramClient(
+            session_path,
+            settings.api_id,
+            settings.api_hash,
+            **common_kwargs,
+        )
         session_path_display = session_path
 
-    @client.on(events.NewMessage())
+    # Диагностика «слишком длинных» апдейтов
+    @client.on(events.Raw)
+    async def _raw_diag(update):
+        if isinstance(update, (types.UpdatesTooLong, types.UpdateChannelTooLong)):
+            logger.warning("Raw: got *TooLong* update -> Telethon will fetch difference soon")
+
+    # Основной обработчик
+    @client.on(events.NewMessage(incoming=True))
     async def handler(event: events.newmessage.NewMessage.Event) -> None:
         try:
-            logger.info("New message %s", event.message.id)
             message = event.message
             peer = await event.get_chat()
             channel_name: Optional[str] = getattr(peer, "title", None) or getattr(peer, "username", None) or "unknown"
+            channel_id = getattr(peer, "id", None)
 
             message_id = message.id
             date: datetime = message.date
@@ -120,10 +149,13 @@ async def run_service(settings: Settings) -> None:
             except Exception:
                 author = None
 
-            # Exclude by words (case-insensitive)
+            # Фильтр по стоп-словам
             text_lower = raw_text.lower()
             if any(word.lower() in text_lower for word in settings.exclude_words):
-                logger.info("Skipped message %s from %s due to exclude words", message_id, channel_name)
+                logger.info(
+                    "Skipped message %s (chan=%s id=%s) due to exclude words",
+                    message_id, channel_name, channel_id
+                )
                 return
 
             await db.insert_message(
@@ -134,7 +166,10 @@ async def run_service(settings: Settings) -> None:
                 author=author,
                 status="new",
             )
-            logger.info("Saved message %s from %s", message_id, channel_name)
+            logger.info(
+                "Saved message %s (chan=%s id=%s) at %s",
+                message_id, channel_name, channel_id, date.isoformat()
+            )
         except Exception as e:
             logger.exception("Failed to process message: %s", e)
 
@@ -149,8 +184,26 @@ async def run_service(settings: Settings) -> None:
                 logger.exception("Cleanup job failed")
             await asyncio.sleep(settings.cleanup_interval_minutes * 60)
 
-    # Подключение БЕЗ start() и БЕЗ интерактива.
+    async def health_job() -> None:
+        while True:
+            try:
+                state = await client(functions.updates.GetStateRequest())
+                logger.debug(
+                    "Health: updates state pts=%s qts=%s seq=%s date=%s",
+                    getattr(state, "pts", None),
+                    getattr(state, "qts", None),
+                    getattr(state, "seq", None),
+                    getattr(state, "date", None),
+                )
+            except Exception as e:
+                logger.warning("Health: failed to get updates state: %r", e)
+            finally:
+                await asyncio.sleep(60)
+
+    # Подключение без интерактива
     await client.connect()
+    cleanup_task = None
+    health_task = None
     try:
         if not await client.is_user_authorized():
             if using_string:
@@ -162,6 +215,12 @@ async def run_service(settings: Settings) -> None:
                 )
             return
 
+        # Warm-up
+        try:
+            await client.get_dialogs(limit=1)
+        except Exception:
+            logger.exception("Warm-up get_dialogs failed")
+
         me = await client.get_me()
         logger.info(
             "Authorized as %s. Session: %s",
@@ -170,8 +229,10 @@ async def run_service(settings: Settings) -> None:
         )
 
         logger.info("Client started. Listening for new messages...")
-        asyncio.create_task(cleanup_job())
+        cleanup_task = asyncio.create_task(cleanup_job())
+        health_task = asyncio.create_task(health_job())
 
+        # Ожидаем сигнал ОС ИЛИ разрыв клиента
         stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -180,16 +241,55 @@ async def run_service(settings: Settings) -> None:
             except NotImplementedError:
                 pass
 
-        await stop_event.wait()
+        # Важно: client.disconnected — Future, не оборачиваем в create_task
+        # А вот stop_event.wait() — корутина, её нужно превратить в Task
+        stop_wait_task = asyncio.create_task(stop_event.wait())
+        try:
+            done, pending = await asyncio.wait(
+                {stop_wait_task, client.disconnected},
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            # Если отключился клиент — сообщим
+            if client.disconnected in done and not stop_event.is_set():
+                logger.warning("Client disconnected unexpectedly — shutting down gracefully")
+        finally:
+            if not stop_wait_task.done():
+                stop_wait_task.cancel()
+                try:
+                    await stop_wait_task
+                except asyncio.CancelledError:
+                    pass
 
     finally:
-        # Для файловой сессии — сохранить на выходе; для StringSession — не требуется.
+        # Аккуратно гасим фоновые задачи, чтобы aiosqlite не писала в закрытый loop
+        for task in (cleanup_task, health_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logging.getLogger("app").exception("Background task failed during shutdown")
+
+        # Сохраняем файловую сессию, если надо
         if not using_string:
             try:
                 client.session.save()
             except Exception:
                 logging.getLogger("app").exception("Failed to save session on shutdown")
-        await client.disconnect()
+
+        # Отключаемся от Telegram
+        try:
+            await client.disconnect()
+        finally:
+            # Корректно закрываем БД (если в вашем Database есть close)
+            try:
+                close_coro = getattr(db, "close", None)
+                if callable(close_coro):
+                    await close_coro()
+            except Exception:
+                logging.getLogger("app").exception("Failed to close database")
 
 
 async def main() -> None:

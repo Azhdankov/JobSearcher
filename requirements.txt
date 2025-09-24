@@ -1,4 +1,4 @@
-telethon==1.36.0
+telethon==1.41.2
 python-dotenv==1.0.1
 pydantic==2.9.2
 aiosqlite==0.20.0
