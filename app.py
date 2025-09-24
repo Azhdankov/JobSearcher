@@ -124,9 +124,8 @@ async def run_service(settings: Settings) -> None:
 
     # Диагностика «слишком длинных» апдейтов
     @client.on(events.Raw)
-    async def _raw_diag(ev: events.Raw):
-        upd = ev.update
-        if isinstance(upd, (types.UpdatesTooLong, types.UpdateChannelTooLong)):
+    async def _raw_diag(update):
+        if isinstance(update, (types.UpdatesTooLong, types.UpdateChannelTooLong)):
             logger.warning("Raw: got *TooLong* update -> Telethon will fetch difference soon")
 
     # Основной обработчик
