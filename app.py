@@ -44,7 +44,6 @@ def load_settings() -> Settings:
         "CLEANUP_INTERVAL_MINUTES": int(os.getenv("CLEANUP_INTERVAL_MINUTES", "60")),
         "FILTER_EXCLUDE_WORDS": os.getenv("FILTER_EXCLUDE_WORDS", ""),
     }
-    # Parse FILTER_EXCLUDE_WORDS as JSON array or comma-separated string
     raw_words = env["FILTER_EXCLUDE_WORDS"]
     if isinstance(raw_words, list):
         parsed_words = [str(w).strip() for w in raw_words if str(w).strip()]
@@ -93,7 +92,6 @@ async def run_service(settings: Settings) -> None:
     db = Database(settings.sqlite_db_path)
     await db.init()
 
-    # Устойчивые параметры клиента
     common_kwargs = dict(
         connection_retries=None,
         request_retries=100,
@@ -122,13 +120,6 @@ async def run_service(settings: Settings) -> None:
         )
         session_path_display = session_path
 
-    # Диагностика «слишком длинных» апдейтов
-    @client.on(events.Raw)
-    async def _raw_diag(update):
-        if isinstance(update, (types.UpdatesTooLong, types.UpdateChannelTooLong)):
-            logger.warning("Raw: got *TooLong* update -> Telethon will fetch difference soon")
-
-    # Основной обработчик
     @client.on(events.NewMessage(incoming=True))
     async def handler(event: events.newmessage.NewMessage.Event) -> None:
         try:
@@ -149,8 +140,17 @@ async def run_service(settings: Settings) -> None:
             except Exception:
                 author = None
 
+            # Фильтр: пропускаем пустые и слишком короткие сообщения (< 20 символов)
+            text_clean = (raw_text or "").strip()
+            if not text_clean or len(text_clean) < 20:
+                logger.info(
+                    "Skipped message %s (chan=%s id=%s) due to empty/short text",
+                    message_id, channel_name, channel_id
+                )
+                return
+
             # Фильтр по стоп-словам
-            text_lower = raw_text.lower()
+            text_lower = text_clean.lower()
             if any(word.lower() in text_lower for word in settings.exclude_words):
                 logger.info(
                     "Skipped message %s (chan=%s id=%s) due to exclude words",
@@ -162,7 +162,7 @@ async def run_service(settings: Settings) -> None:
                 message_id=message_id,
                 channel_name=channel_name,
                 date=date,
-                raw_text=raw_text,
+                raw_text=text_clean,
                 author=author,
                 status="new",
             )
@@ -200,7 +200,6 @@ async def run_service(settings: Settings) -> None:
             finally:
                 await asyncio.sleep(60)
 
-    # Подключение без интерактива
     await client.connect()
     cleanup_task = None
     health_task = None
@@ -215,7 +214,6 @@ async def run_service(settings: Settings) -> None:
                 )
             return
 
-        # Warm-up
         try:
             await client.get_dialogs(limit=1)
         except Exception:
@@ -232,7 +230,6 @@ async def run_service(settings: Settings) -> None:
         cleanup_task = asyncio.create_task(cleanup_job())
         health_task = asyncio.create_task(health_job())
 
-        # Ожидаем сигнал ОС ИЛИ разрыв клиента
         stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -241,15 +238,12 @@ async def run_service(settings: Settings) -> None:
             except NotImplementedError:
                 pass
 
-        # Важно: client.disconnected — Future, не оборачиваем в create_task
-        # А вот stop_event.wait() — корутина, её нужно превратить в Task
         stop_wait_task = asyncio.create_task(stop_event.wait())
         try:
             done, pending = await asyncio.wait(
                 {stop_wait_task, client.disconnected},
                 return_when=asyncio.FIRST_COMPLETED
             )
-            # Если отключился клиент — сообщим
             if client.disconnected in done and not stop_event.is_set():
                 logger.warning("Client disconnected unexpectedly — shutting down gracefully")
         finally:
@@ -261,7 +255,7 @@ async def run_service(settings: Settings) -> None:
                     pass
 
     finally:
-        # Аккуратно гасим фоновые задачи, чтобы aiosqlite не писала в закрытый loop
+        # Корректно завершаем фоновые задачи и соединения
         for task in (cleanup_task, health_task):
             if task is not None:
                 task.cancel()
@@ -272,18 +266,15 @@ async def run_service(settings: Settings) -> None:
                 except Exception:
                     logging.getLogger("app").exception("Background task failed during shutdown")
 
-        # Сохраняем файловую сессию, если надо
         if not using_string:
             try:
                 client.session.save()
             except Exception:
                 logging.getLogger("app").exception("Failed to save session on shutdown")
 
-        # Отключаемся от Telegram
         try:
             await client.disconnect()
         finally:
-            # Корректно закрываем БД (если в вашем Database есть close)
             try:
                 close_coro = getattr(db, "close", None)
                 if callable(close_coro):
