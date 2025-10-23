@@ -122,11 +122,19 @@ async def run_service(settings: Settings) -> None:
         )
         session_path_display = session_path
 
-    # Диагностика «слишком длинных» апдейтов
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Диагностика «слишком длинных» апдейтов (без падений и без лишнего шума)
     @client.on(events.Raw)
-    async def _raw_diag(update):
-        if isinstance(update, (types.UpdatesTooLong, types.UpdateChannelTooLong)):
+    async def _raw_diag(ev) -> None:
+        # В разных версиях Telethon сюда приходит либо Event с .update,
+        # либо сразу объект Update*. Берём универсально:
+        upd = getattr(ev, "update", ev)
+
+        # Логируем только маркёры, ведущие к difference, остальное игнорируем
+        if isinstance(upd, (types.UpdatesTooLong, types.UpdateChannelTooLong)):
             logger.warning("Raw: got *TooLong* update -> Telethon will fetch difference soon")
+        # при необходимости можно добавить иные ветки, но избегаем спама
+    # ─────────────────────────────────────────────────────────────────────────────
 
     # Основной обработчик
     @client.on(events.NewMessage(incoming=True))
@@ -239,29 +247,35 @@ async def run_service(settings: Settings) -> None:
             try:
                 loop.add_signal_handler(sig, stop_event.set)
             except NotImplementedError:
+                # Например, на Windows внутри некоторых рантаймов
                 pass
 
-        # Важно: client.disconnected — Future, не оборачиваем в create_task
-        # А вот stop_event.wait() — корутина, её нужно превратить в Task
-        stop_wait_task = asyncio.create_task(stop_event.wait())
-        try:
-            done, pending = await asyncio.wait(
-                {stop_wait_task, client.disconnected},
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            # Если отключился клиент — сообщим
-            if client.disconnected in done and not stop_event.is_set():
-                logger.warning("Client disconnected unexpectedly — shutting down gracefully")
-        finally:
-            if not stop_wait_task.done():
-                stop_wait_task.cancel()
-                try:
-                    await stop_wait_task
-                except asyncio.CancelledError:
-                    pass
+        # Важно: client.disconnected — Future (его НЕ оборачиваем в create_task).
+        # Ошибка была из-за передачи корутины stop_event.wait() напрямую.
+        stop_wait_task = asyncio.create_task(stop_event.wait(), name="stop_event.wait()")
+
+        done, pending = await asyncio.wait(
+            {stop_wait_task, client.disconnected},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if stop_wait_task in done:
+            logger.info("Stop signal received — disconnecting client")
+            # Мягко отключаемся: это также завершит client.disconnected
+            await client.disconnect()
+        elif client.disconnected in done and not stop_event.is_set():
+            logger.warning("Client disconnected unexpectedly — shutting down gracefully")
+
+        # Убираем задачу ожидания сигнала, если она ещё жива
+        if not stop_wait_task.done():
+            stop_wait_task.cancel()
+            try:
+                await stop_wait_task
+            except asyncio.CancelledError:
+                pass
 
     finally:
-        # Аккуратно гасим фоновые задачи, чтобы aiosqlite не писала в закрытый loop
+        # Аккуратно гасим фоновые задачи
         for task in (cleanup_task, health_task):
             if task is not None:
                 task.cancel()
@@ -272,7 +286,7 @@ async def run_service(settings: Settings) -> None:
                 except Exception:
                     logging.getLogger("app").exception("Background task failed during shutdown")
 
-        # Сохраняем файловую сессию, если надо
+        # Сохраняем файловую сессию, если это не StringSession
         if not using_string:
             try:
                 client.session.save()
@@ -283,7 +297,7 @@ async def run_service(settings: Settings) -> None:
         try:
             await client.disconnect()
         finally:
-            # Корректно закрываем БД (если в вашем Database есть close)
+            # Закрываем БД, если реализовано
             try:
                 close_coro = getattr(db, "close", None)
                 if callable(close_coro):

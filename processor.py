@@ -117,6 +117,14 @@ def format_selected_for_message(all_items: list[dict], selected_keys: set[tuple[
     return "\n\n".join(parts)
 
 
+def format_single_selected_message(item: dict) -> str:
+    title = f"[{item['channel_name']}] #{item['id']} {item['date']}"
+    snippet = (item.get("raw_text") or "").strip()
+    if len(snippet) > 800:
+        snippet = snippet[:800] + "…"
+    return f"{title}\n{snippet}"
+
+
 async def process_once(settings: ProcSettings) -> None:
     logger = logging.getLogger("processor")
     db = Database(settings.sqlite_db_path)
@@ -151,10 +159,16 @@ async def process_once(settings: ProcSettings) -> None:
     # Notify Telegram bot if configured
     if settings.telegram_bot_token and settings.telegram_chat_id:
         selected_set = {(i["id"], i["channel_name"], i["date"]) for i in selected_keys}
-        text = format_selected_for_message(items, selected_set)
+        # Отправлять отдельное сообщение на каждый выбранный элемент
+        selected_items = [it for it in items if (it["id"], it["channel_name"], it["date"]) in selected_set]
         try:
-            await send_to_telegram_bot(settings.telegram_bot_token, settings.telegram_chat_id, text)
-            logger.info("Отправлено в бота: %s символов", len(text))
+            if selected_items:
+                for it in selected_items:
+                    text = format_single_selected_message(it)
+                    await send_to_telegram_bot(settings.telegram_bot_token, settings.telegram_chat_id, text)
+                    logger.info("Отправлено сообщение для #%s (%s)", it["id"], it["channel_name"])
+            else:
+                logger.info("Нет подходящих сообщений — отправка пропущена")
         except Exception:
             logger.exception("Не удалось отправить сообщение в Telegram бота")
     else:
