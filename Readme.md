@@ -60,19 +60,45 @@ python app.py
 При первом запуске потребуется ввести код из Telegram (смс/приложение). Если включена 2FA — понадобится пароль из `TELEGRAM_PASSWORD`.
 
 ### Запуск через Docker Compose (рекомендуется для сервера)
-1. Подготовьте файл `.env` (как выше). `API_ID`, `API_HASH`, `PHONE_NUMBER` и, при необходимости, `TELEGRAM_PASSWORD` обязателены.
-2. Соберите и запустите контейнер:
+
+1. подготовить папку и .env (вписать свои API-данные):
+```   
+mkdir -p data
+cat > .env << 'EOF'
+TELEGRAM_API_ID=YOUR_ID
+TELEGRAM_API_HASH=YOUR_HASH
+TELEGRAM_PHONE_NUMBER=+79990000000
+# TELEGRAM_PASSWORD=your_2fa_password   # если есть
+SQLITE_DB_PATH=/data/telegram_messages.db
+EOF
 ```
-docker compose up -d --build
+
+2. собрать образ:
 ```
-3. Важно: при первой авторизации потребуется код. Подключитесь к контейнеру и завершите логин:
+docker compose build --no-cache app
 ```
-docker attach jobsearcher-app
-# Введите код, затем при необходимости 2FA пароль
+
+3. одноразово получить строку сессии:
+```
+docker compose run --rm --entrypoint python app /app/auth_cli.py
+```
+
+4. скопировать выведенную длинную строку. добавить строку сессии в .env:
+```
+TELEGRAM_STRING_SESSION='СТРОКА_ИЗ_ШАГА_3'
+```
+
+5. запустить сервисы:
+```
+docker compose up -d
+```
+
+6. проверить логи приложения:
+```
+docker compose logs -f app
 ```
 Контейнер будет слушать новые сообщения. База и сессия хранятся в volume-мах:
 - База: `./data/telegram_messages.db`
-- Сессия: файлы в `./sessions`
 
 ### Периодический процессор (OpenAI + Bot)
 Скрипт `processor.py` раз в N секунд (по умолчанию 7200) делает:
