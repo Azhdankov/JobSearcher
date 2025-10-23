@@ -247,15 +247,32 @@ async def run_service(settings: Settings) -> None:
             try:
                 loop.add_signal_handler(sig, stop_event.set)
             except NotImplementedError:
+                # Например, на Windows внутри некоторых рантаймов
                 pass
 
-        # Важно: client.disconnected — Future, не оборачиваем в create_task
+        # Важно: client.disconnected — Future (его НЕ оборачиваем в create_task).
+        # Ошибка была из-за передачи корутины stop_event.wait() напрямую.
+        stop_wait_task = asyncio.create_task(stop_event.wait(), name="stop_event.wait()")
+
         done, pending = await asyncio.wait(
-            {stop_event.wait(), client.disconnected},
-            return_when=asyncio.FIRST_COMPLETED
+            {stop_wait_task, client.disconnected},
+            return_when=asyncio.FIRST_COMPLETED,
         )
-        if client.disconnected in done and not stop_event.is_set():
+
+        if stop_wait_task in done:
+            logger.info("Stop signal received — disconnecting client")
+            # Мягко отключаемся: это также завершит client.disconnected
+            await client.disconnect()
+        elif client.disconnected in done and not stop_event.is_set():
             logger.warning("Client disconnected unexpectedly — shutting down gracefully")
+
+        # Убираем задачу ожидания сигнала, если она ещё жива
+        if not stop_wait_task.done():
+            stop_wait_task.cancel()
+            try:
+                await stop_wait_task
+            except asyncio.CancelledError:
+                pass
 
     finally:
         # Аккуратно гасим фоновые задачи
