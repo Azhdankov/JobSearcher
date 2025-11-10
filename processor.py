@@ -41,16 +41,14 @@ async def call_openai_select(api_key: str, model: str, prompt: str, items: list[
         {
             "id": it["id"],
             "channel_name": it["channel_name"],
-            "date": it["date"],
-            "author": it.get("author"),
             "raw_text": it.get("raw_text", ""),
         }
         for it in items
     ]
     system_message = (
-        "Ты помощник по отбору вакансий. Тебе дается массив сообщений из Telegram с полями id, channel_name, date, author, raw_text.\n"
-        f"Критерии отбора: {prompt}\n"
-        "Проанализируй сообщения и верни JSON строго в формате: {\"selected\":[{\"id\":number,\"channel_name\":string,\"date\":string}]}.\n"
+        "Ты помощник по отбору вакансий. Тебе дается массив сообщений из Telegram с полями id, channel_name, raw_text.\n"
+        f"Критерии отбора: Ты — интеллектуальный фильтр вакансий для дизайнера. Твоя задача — анализировать тексты из Telegram-каналов и определять, является ли сообщение релевантной вакансией, которая подходит кандидату. Критерии ПОДХОДЯЩИХ вакансий (все условия ДОЛЖНЫ выполняться: всего 3 условия): 1.  Должность (хотя бы один критерий должен выполниться): - Веб-дизайнер - UX/UI-дизайнер - Junior Дизайнер - Дизайнер интерфейсов - Продуктовый дизайнер - Начинающий дизайнер (в контексте UX/UI или веба) 2.  Уровень: - Junior (Junior, Начинающий, Стажер) - Иногда Middle (если не указан уровень, но обязанности подходят) - НЕ ПОДХОДЯТ: Senior, Lead, Principal, Head of Design. 3.  Сфера деятельности (хотя бы один критерий должен выполниться): - Веб-сайты, лендинги - Веб-приложения, SaaS, CRM-системы - Мобильные приложения (UI/UX) - Проектыне задачи - НЕ ПОДХОДЯТ: Графический дизайнер, моушн-дизайнер, дизайнер полиграфии, работа с карточками товаров для OZON/Wildberries/маркетплейсов. Критерии НЕПОДХОДЯЩИХ сообщений (отсеивай их): - Приветственные сообщения из чатов и каналов - Сообщения от дизайнеров, которые ищут работу или рекламируют свои услуги - Нерелевантные вакансии: Любые вакансии, не связанные с вебом и UI/UX, включая графический дизайн, моушн. - Вакансии уровня Senior+ - \"Фриланс-вакансии\" — если в тексте есть маркеры: \"небольшой проект\", \"разовое задание\", \"несложный лендинг\", \"на 1-2 недели\", \"для стартапа с маленьким бюджетом\".\n"
+        "Проанализируй сообщения и верни JSON строго в формате: {\"selected\":[{\"id\":number,\"channel_name\":string}]}.\n"
         "Не включай ничего, кроме валидного JSON."
     )
     user_message = {
@@ -84,11 +82,10 @@ async def call_openai_select(api_key: str, model: str, prompt: str, items: list[
         # Basic validation
         result: list[dict] = []
         for item in selected:
-            if all(k in item for k in ("id", "channel_name", "date")):
+            if all(k in item for k in ("id", "channel_name")):
                 result.append({
                     "id": int(item["id"]),
                     "channel_name": str(item["channel_name"]),
-                    "date": str(item["date"]),
                 })
         return result
     except Exception:
@@ -99,7 +96,12 @@ async def call_openai_select(api_key: str, model: str, prompt: str, items: list[
 async def send_to_telegram_bot(token: str, chat_id: str, text: str) -> None:
     api_url = f"https://api.telegram.org/bot{token}/sendMessage"
     async with httpx.AsyncClient(timeout=30) as client:
-        await client.post(api_url, json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
+        await client.post(api_url, json={
+            "chat_id": chat_id, 
+            "text": text, 
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        })
 
 
 def format_selected_for_message(all_items: list[dict], selected_keys: set[tuple[int, str, str]]) -> str:
@@ -109,8 +111,6 @@ def format_selected_for_message(all_items: list[dict], selected_keys: set[tuple[
         if key in selected_keys:
             title = f"[{it['channel_name']}] #{it['id']} {it['date']}"
             snippet = (it.get("raw_text") or "").strip()
-            if len(snippet) > 800:
-                snippet = snippet[:800] + "…"
             parts.append(f"{title}\n{snippet}")
     if not parts:
         return "Подходящих сообщений не найдено за период."
@@ -118,11 +118,16 @@ def format_selected_for_message(all_items: list[dict], selected_keys: set[tuple[
 
 
 def format_single_selected_message(item: dict) -> str:
-    title = f"[{item['channel_name']}] #{item['id']} {item['date']}"
+    title = f"[{item['channel_name']}]"
     snippet = (item.get("raw_text") or "").strip()
-    if len(snippet) > 800:
-        snippet = snippet[:800] + "…"
-    return f"{title}\n{snippet}"
+    
+    # Формируем ссылку на сообщение
+    message_link = ""
+    if item.get("channel_id") and item.get("id"):
+        # Для приватных каналов используем формат с c/
+        message_link = f"\n\n🔗 [Перейти к сообщению](https://t.me/c/{item['channel_id']}/{item['id']})"
+    
+    return f"{title}\n{snippet}{message_link}"
 
 
 async def process_once(settings: ProcSettings) -> None:
@@ -158,9 +163,9 @@ async def process_once(settings: ProcSettings) -> None:
 
     # Notify Telegram bot if configured
     if settings.telegram_bot_token and settings.telegram_chat_id:
-        selected_set = {(i["id"], i["channel_name"], i["date"]) for i in selected_keys}
+        selected_set = {(i["id"], i["channel_name"]) for i in selected_keys}
         # Отправлять отдельное сообщение на каждый выбранный элемент
-        selected_items = [it for it in items if (it["id"], it["channel_name"], it["date"]) in selected_set]
+        selected_items = [it for it in items if (it["id"], it["channel_name"]) in selected_set]
         try:
             if selected_items:
                 for it in selected_items:

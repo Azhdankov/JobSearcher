@@ -6,6 +6,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER NOT NULL,
     channel_name TEXT NOT NULL,
+    channel_id INTEGER,
     date TEXT NOT NULL,
     raw_text TEXT,
     author TEXT,
@@ -41,6 +42,7 @@ class Database:
         self,
         message_id: int,
         channel_name: str,
+        channel_id: Optional[int],
         date: datetime,
         raw_text: str,
         author: Optional[str],
@@ -50,10 +52,10 @@ class Database:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 """
-                INSERT OR IGNORE INTO messages (id, channel_name, date, raw_text, author, status)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO messages (id, channel_name, channel_id, date, raw_text, author, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (message_id, channel_name, iso_date, raw_text, author, status),
+                (message_id, channel_name, channel_id, iso_date, raw_text, author, status),
             )
             await db.commit()
 
@@ -84,10 +86,10 @@ class Database:
     async def select_new_messages_ordered(self, limit: int | None = None) -> list[dict]:
         """Return list of messages with status 'new' ordered by date ASC.
 
-        Each item is a dict with keys: id, channel_name, date (ISO str), raw_text, author, status.
+        Each item is a dict with keys: id, channel_name, channel_id, date (ISO str), raw_text, author, status.
         """
         query = (
-            "SELECT id, channel_name, date, raw_text, author, status "
+            "SELECT id, channel_name, channel_id, date, raw_text, author, status "
             "FROM messages WHERE status = 'new' ORDER BY datetime(date) ASC"
         )
         if limit is not None:

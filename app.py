@@ -157,6 +157,14 @@ async def run_service(settings: Settings) -> None:
             except Exception:
                 author = None
 
+            # Фильтр по длине сообщения
+            if len(raw_text) < 20:
+                logger.info(
+                    "Skipped message %s (chan=%s id=%s) due to short length (%d chars)",
+                    message_id, channel_name, channel_id, len(raw_text)
+                )
+                return
+
             # Фильтр по стоп-словам
             text_lower = raw_text.lower()
             if any(word.lower() in text_lower for word in settings.exclude_words):
@@ -169,6 +177,7 @@ async def run_service(settings: Settings) -> None:
             await db.insert_message(
                 message_id=message_id,
                 channel_name=channel_name,
+                channel_id=channel_id,
                 date=date,
                 raw_text=raw_text,
                 author=author,
