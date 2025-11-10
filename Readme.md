@@ -100,6 +100,40 @@ docker compose logs -f app
 Контейнер будет слушать новые сообщения. База и сессия хранятся в volume-мах:
 - База: `./data/telegram_messages.db`
 
+### Полезности
+1. Обычная перезагрузка (без потери данных).
+```
+docker compose restart app
+```
+(мягкий рестарт только сервиса app)
+
+2. Полная перезагрузка стека
+```
+docker compose down
+docker compose up -d
+```
+Это безопасно: данные в ./data сохранятся (volume на хосте).
+Не используйте down -v, если не хотите потерять БД.
+
+3. Когда меняли код
+```
+docker compose build app
+docker compose up -d
+```
+(или одним: docker compose up -d --build)
+
+4. Когда меняли .env
+```
+docker compose up -d --force-recreate
+```
+(чтобы контейнер перечитал переменные)
+
+5. Быстрый «чистый» перезапуск только приложения
+```
+docker compose rm -sf app
+docker compose up -d app
+```
+
 ### Периодический процессор (OpenAI + Bot)
 Скрипт `processor.py` раз в N секунд (по умолчанию 7200) делает:
 1) SELECT всех записей со статусом `new` (ORDER BY `date` ASC)
