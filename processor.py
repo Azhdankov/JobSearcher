@@ -67,7 +67,7 @@ async def call_openai_select(api_key: str, model: str, prompt: str, items: list[
             user_message,
         ],
         "response_format": {"type": "json_object"},
-        "temperature": 0.2,
+        "temperature": 0.0,
     }
 
     async with httpx.AsyncClient(timeout=60) as client:
