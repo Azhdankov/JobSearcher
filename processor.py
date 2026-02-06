@@ -35,6 +35,8 @@ async def call_openai_select(api_key: str, model: str, prompt: str, items: list[
     """Call OpenAI with list of items and return list of {id, channel_name, date} that match criteria.
 
     The model should return JSON with structure: { "selected": [ {"id": int, "channel_name": str, "date": str} ] }
+    
+    IMPORTANT: Each call is completely independent - no context from previous calls is used.
     """
     # Prepare compact payload: send only required fields
     payload_items = [
@@ -45,16 +47,37 @@ async def call_openai_select(api_key: str, model: str, prompt: str, items: list[
         }
         for it in items
     ]
+    
+    # Generate unique request identifier to ensure independence
+    request_id = datetime.now().isoformat()
+    
+    # Build system message with explicit independence instruction
+    base_criteria = (
+        "Ты — интеллектуальный фильтр вакансий для дизайнера. Твоя задача — анализировать тексты из Telegram-каналов и определять, является ли сообщение релевантной вакансией, которая подходит кандидату. "
+        "Критерии ПОДХОДЯЩИХ вакансий (все условия ДОЛЖНЫ выполняться: всего 3 условия): "
+        "1. Должность (хотя бы один критерий должен выполниться): - Веб-дизайнер - UX/UI-дизайнер - Junior Дизайнер - Дизайнер интерфейсов - Продуктовый дизайнер - Начинающий дизайнер (в контексте UX/UI или веба) "
+        "2. Уровень: - Junior (Junior, Начинающий, Стажер) - Иногда Middle (если не указан уровень, но обязанности подходят) - НЕ ПОДХОДЯТ: Senior, Lead, Principal, Head of Design. "
+        "3. Сфера деятельности (хотя бы один критерий должен выполниться): - Веб-сайты, лендинги - Веб-приложения, SaaS, CRM-системы - Мобильные приложения (UI/UX) - Проектыне задачи - НЕ ПОДХОДЯТ: Графический дизайнер, моушн-дизайнер, дизайнер полиграфии, работа с карточками товаров для OZON/Wildberries/маркетплейсов. "
+        "Критерии НЕПОДХОДЯЩИХ сообщений (отсеивай их): - Приветственные сообщения из чатов и каналов - Сообщения от дизайнеров, которые ищут работу или рекламируют свои услуги - Нерелевантные вакансии: Любые вакансии, не связанные с вебом и UI/UX, включая графический дизайн, моушн. - Вакансии уровня Senior+ - \"Фриланс-вакансии\" — если в тексте есть маркеры: \"небольшой проект\", \"разовое задание\", \"несложный лендинг\", \"на 1-2 недели\", \"для стартапа с маленьким бюджетом\"."
+    )
+    
+    # Use custom prompt if provided, otherwise use default criteria
+    criteria_text = prompt if prompt and prompt.strip() != "Отберите вакансии по моим критериям." else base_criteria
+    
     system_message = (
-        "Ты помощник по отбору вакансий. Тебе дается массив сообщений из Telegram с полями id, channel_name, raw_text.\n"
-        f"Критерии отбора: Ты — интеллектуальный фильтр вакансий для дизайнера. Твоя задача — анализировать тексты из Telegram-каналов и определять, является ли сообщение релевантной вакансией, которая подходит кандидату. Критерии ПОДХОДЯЩИХ вакансий (все условия ДОЛЖНЫ выполняться: всего 3 условия): 1.  Должность (хотя бы один критерий должен выполниться): - Веб-дизайнер - UX/UI-дизайнер - Junior Дизайнер - Дизайнер интерфейсов - Продуктовый дизайнер - Начинающий дизайнер (в контексте UX/UI или веба) 2.  Уровень: - Junior (Junior, Начинающий, Стажер) - Иногда Middle (если не указан уровень, но обязанности подходят) - НЕ ПОДХОДЯТ: Senior, Lead, Principal, Head of Design. 3.  Сфера деятельности (хотя бы один критерий должен выполниться): - Веб-сайты, лендинги - Веб-приложения, SaaS, CRM-системы - Мобильные приложения (UI/UX) - Проектыне задачи - НЕ ПОДХОДЯТ: Графический дизайнер, моушн-дизайнер, дизайнер полиграфии, работа с карточками товаров для OZON/Wildberries/маркетплейсов. Критерии НЕПОДХОДЯЩИХ сообщений (отсеивай их): - Приветственные сообщения из чатов и каналов - Сообщения от дизайнеров, которые ищут работу или рекламируют свои услуги - Нерелевантные вакансии: Любые вакансии, не связанные с вебом и UI/UX, включая графический дизайн, моушн. - Вакансии уровня Senior+ - \"Фриланс-вакансии\" — если в тексте есть маркеры: \"небольшой проект\", \"разовое задание\", \"несложный лендинг\", \"на 1-2 недели\", \"для стартапа с маленьким бюджетом\".\n"
-        "Проанализируй сообщения и верни JSON строго в формате: {\"selected\":[{\"id\":number,\"channel_name\":string}]}.\n"
+        f"ВНИМАНИЕ: Это независимый запрос (ID: {request_id}). "
+        "Ты НЕ должен использовать информацию из предыдущих запросов или сессий. "
+        "Каждый запрос обрабатывается полностью изолированно.\n\n"
+        "Ты помощник по отбору вакансий. Тебе дается массив сообщений из Telegram с полями id, channel_name, raw_text.\n\n"
+        f"Критерии отбора: {criteria_text}\n\n"
+        "Проанализируй ТОЛЬКО сообщения из текущего запроса и верни JSON строго в формате: {\"selected\":[{\"id\":number,\"channel_name\":string}]}.\n"
         "Не включай ничего, кроме валидного JSON."
     )
+    
     user_message = {
         "role": "user",
         "content": [
-            {"type": "text", "text": "Сообщения:"},
+            {"type": "text", "text": f"Проанализируй следующие сообщения (запрос {request_id}):"},
             {"type": "text", "text": json.dumps(payload_items, ensure_ascii=False)},
         ],
     }
@@ -68,17 +91,26 @@ async def call_openai_select(api_key: str, model: str, prompt: str, items: list[
         ],
         "response_format": {"type": "json_object"},
         "temperature": 0.0,
+        # Use unique user ID per request to ensure no context sharing
+        "user": f"jobsearcher_{request_id}",
     }
 
+    logger = logging.getLogger("processor")
+    logger.debug("Отправка запроса к OpenAI (ID: %s, элементов: %d)", request_id, len(payload_items))
+    
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body)
         resp.raise_for_status()
         data = resp.json()
 
     content = data["choices"][0]["message"]["content"]
+    logger.debug("Получен ответ от OpenAI (ID: %s, длина: %d символов)", request_id, len(content))
+    
     try:
         parsed = json.loads(content)
         selected = parsed.get("selected", [])
+        logger.info("OpenAI вернул %d выбранных элементов из %d отправленных (ID запроса: %s)", len(selected), len(payload_items), request_id)
+        
         # Basic validation
         result: list[dict] = []
         for item in selected:
@@ -87,9 +119,13 @@ async def call_openai_select(api_key: str, model: str, prompt: str, items: list[
                     "id": int(item["id"]),
                     "channel_name": str(item["channel_name"]),
                 })
+            else:
+                logger.warning("Пропущен элемент с неполными данными: %s", item)
+        
+        logger.info("Валидировано %d элементов из %d возвращенных OpenAI", len(result), len(selected))
         return result
     except Exception:
-        logging.getLogger("processor").exception("Failed to parse OpenAI response")
+        logger.exception("Не удалось распарсить ответ OpenAI (ID запроса: %s, ответ: %s)", request_id, content[:200])
         return []
 
 
