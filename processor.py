@@ -13,7 +13,7 @@ from db import Database
 
 class ProcSettings:
     def __init__(self) -> None:
-        load_dotenv()
+        load_dotenv(encoding="utf-8")
         self.sqlite_db_path = os.getenv("SQLITE_DB_PATH", "./telegram_messages.db")
         self.log_level = os.getenv("LOG_LEVEL", "INFO")
         self.poll_interval_seconds = int(os.getenv("PROCESSOR_INTERVAL_SECONDS", str(2 * 60 * 60)))
@@ -62,7 +62,17 @@ async def call_openai_select(api_key: str, model: str, prompt: str, items: list[
     )
     
     # Use custom prompt if provided, otherwise use default criteria
-    criteria_text = prompt if prompt and prompt.strip() != "Отберите вакансии по моим критериям." else base_criteria
+    # Fallback to base_criteria if prompt has encoding issues (replacement chars)
+    if prompt and prompt.strip() != "Отберите вакансии по моим критериям.":
+        if "\ufffd" in prompt:  # Unicode replacement char = mojibake
+            logging.getLogger("processor").warning(
+                "SELECTION_PROMPT содержит некорректные символы (кодировка) — используются стандартные критерии"
+            )
+            criteria_text = base_criteria
+        else:
+            criteria_text = prompt
+    else:
+        criteria_text = base_criteria
     
     system_message = (
         f"ВНИМАНИЕ: Это независимый запрос (ID: {request_id}). "

@@ -5,7 +5,7 @@ from telethon.sessions import StringSession
 from dotenv import load_dotenv
 
 async def main():
-    load_dotenv()
+    load_dotenv(encoding="utf-8")
     api_id = int(os.environ["TELEGRAM_API_ID"])
     api_hash = os.environ["TELEGRAM_API_HASH"]
     phone = os.environ["TELEGRAM_PHONE_NUMBER"]
