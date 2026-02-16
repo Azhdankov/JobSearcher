@@ -30,7 +30,7 @@ class Settings(BaseModel):
 
 
 def load_settings() -> Settings:
-    load_dotenv()
+    load_dotenv(encoding="utf-8")
     env = {
         "TELEGRAM_API_ID": os.getenv("TELEGRAM_API_ID"),
         "TELEGRAM_API_HASH": os.getenv("TELEGRAM_API_HASH"),
